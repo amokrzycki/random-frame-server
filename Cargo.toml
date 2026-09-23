@@ -16,3 +16,60 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Panic paths and diagnostics that should never reach production unnoticed.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Selected nursery lints: useful ownership, allocation, iterator, and async checks.
+collection_is_never_read = "warn"
+future_not_send = "warn"
+needless_collect = "warn"
+needless_pass_by_ref_mut = "warn"
+or_fun_call = "warn"
+redundant_clone = "warn"
+significant_drop_in_scrutinee = "warn"
+significant_drop_tightening = "warn"
+unused_peekable = "warn"
+
+# Selected restriction lints. The full group is intentionally too noisy.
+allow_attributes_without_reason = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+rc_mutex = "warn"
+unused_result_ok = "warn"
+
+# Kept explicit so the performance policy is visible even when group contents change.
+clone_on_copy = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+inefficient_to_string = "warn"
+large_enum_variant = "warn"
+large_futures = "warn"
+large_types_passed_by_value = "warn"
+manual_let_else = "warn"
+manual_memcpy = "warn"
+map_clone = "warn"
+match_same_arms = "warn"
+needless_borrow = "warn"
+needless_borrowed_reference = "warn"
+needless_pass_by_value = "warn"
+trivially_copy_pass_by_ref = "warn"
+unnecessary_to_owned = "warn"
+unnecessary_wraps = "warn"
+unused_async = "warn"
+wildcard_imports = "warn"
