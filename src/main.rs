@@ -51,6 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a missing signal handler prevents graceful shutdown"
+)]
 async fn shutdown() {
     #[cfg(unix)]
     {
@@ -87,7 +91,7 @@ fn app(state: AppState, max_payload: usize) -> Router {
         .layer(TraceLayer::new_for_http()
             .make_span_with(|request: &axum::http::Request<_>| {
                 let route = request.extensions().get::<axum::extract::MatchedPath>()
-                    .map(axum::extract::MatchedPath::as_str).unwrap_or("unknown");
+                    .map_or("unknown", axum::extract::MatchedPath::as_str);
                 tracing::info_span!("request", method = %request.method(), route)
             })
             .on_response(|response: &axum::http::Response<_>, latency: Duration, _span: &tracing::Span| {
@@ -162,6 +166,10 @@ fn validate_id(sync_id: &str) -> Result<(), StatusCode> {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used as a Result::map_err callback"
+)]
 fn db_error(error: sqlx::Error) -> StatusCode {
     let kind = match &error {
         sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => "unavailable",
@@ -241,7 +249,7 @@ async fn write(
     if body.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let now = unix_time();
+    let now = unix_time()?;
     match expected {
         None => {
             let result = sqlx::query("INSERT INTO sync_chains (sync_id, auth_verifier, revision, payload, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?) ON CONFLICT(sync_id) DO NOTHING")
@@ -292,18 +300,27 @@ async fn write(
     }
 }
 
-fn unix_time() -> i64 {
-    std::time::SystemTime::now()
+fn unix_time() -> Result<i64, StatusCode> {
+    let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_secs() as i64
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "a quoted decimal integer is always a valid header value"
+)]
 fn etag(revision: i64) -> HeaderValue {
     HeaderValue::from_str(&format!("\"{revision}\"")).expect("valid revision ETag")
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test setup and assertions fail immediately on unexpected errors"
+)]
 mod tests {
     use super::*;
     use axum::{
@@ -540,13 +557,13 @@ mod tests {
                 .status(),
             StatusCode::CREATED
         );
-        for rev in 1..10 {
+        for rev in 1_u8..10 {
             assert_eq!(
                 put(
                     &router,
                     TOKEN,
                     ("if-match", &format!("\"{rev}\"")),
-                    vec![rev as u8]
+                    vec![rev]
                 )
                 .await
                 .status(),
@@ -568,7 +585,7 @@ mod tests {
         assert_eq!(tag(&got), "\"11\"");
         assert!(matches!(
             to_bytes(got.into_body(), 100).await.unwrap().as_ref(),
-            [11] | [22]
+            [11 | 22]
         ));
         assert_eq!(
             request(&router, Method::GET, ID, Some(WRONG), None, None, vec![])
