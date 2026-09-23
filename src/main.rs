@@ -17,6 +17,10 @@ use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
 const DEFAULT_MAX_PAYLOAD: usize = 16_000_068;
+const GIT_SHA: &str = match option_env!("RF_SYNC_GIT_SHA") {
+    Some(sha) => sha,
+    None => "unknown",
+};
 type ApiResult = Result<Response, StatusCode>;
 
 #[derive(Clone)]
@@ -195,8 +199,11 @@ async fn health(State(state): State<AppState>) -> ApiResult {
         .map_err(db_error)?;
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        "{\"status\":\"ok\"}",
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        format!("{{\"status\":\"ok\",\"git_sha\":\"{GIT_SHA}\"}}"),
     )
         .into_response())
 }
@@ -413,9 +420,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(health.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(
             to_bytes(health.into_body(), 100).await.unwrap(),
-            "{\"status\":\"ok\"}"
+            format!("{{\"status\":\"ok\",\"git_sha\":\"{GIT_SHA}\"}}")
         );
         let original = vec![0, 255, 0x80, b'R', 0];
         let created = put(&router, TOKEN, ("if-none-match", "*"), original.clone()).await;

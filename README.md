@@ -22,7 +22,7 @@ Configuration: `RF_SYNC_BIND` defaults to `127.0.0.1:8787`; `RF_SYNC_DB` default
 | PUT | `/sync/{sync_id}` | `Authorization: Bearer <token>`, `If-None-Match: *` | `201`, `ETag: "1"`, empty body | Existing ID: `412` |
 | GET | `/sync/{sync_id}` | `Authorization: Bearer <token>` | `200`, octet-stream, exact bytes, strong revision ETag | Missing or wrong bearer: identical empty `404` |
 | PUT | `/sync/{sync_id}` | Bearer, `If-Match: "<positive decimal revision>"`, octet-stream | `204`, incremented ETag, empty body | Authenticated stale/future revision: `412`; missing or wrong bearer: `404` |
-| GET | `/health` | None | `200`, `{"status":"ok"}` after `SELECT 1` | SQLite failure: `500` |
+| GET | `/health` | None | `200`, `{"status":"ok","git_sha":"..."}` after `SELECT 1` | SQLite failure: `500` |
 
 Malformed IDs, tokens, conditional headers, content type, or empty PUT bodies return empty `400`; bodies over the limit return `413`. Internal SQLite errors return empty `500`. The update `If-Match` parser accepts canonical positive signed-64-bit decimal revisions only: no zero, leading zero, weak tags, lists, or wildcard. Missing and unauthorized GET/UPDATE have the same public status and empty body; timing is not equalized. A create attempt on an existing ID returns `412` regardless of bearer, as required by create semantics.
 
@@ -32,23 +32,9 @@ Malformed IDs, tokens, conditional headers, content type, or empty PUT bodies re
 
 Operational logs contain method, route template, status, latency, and internal DB error kind. They omit headers, full `sync_id`, token, verifier, and payload.
 
-## VPS example
+## Production deployment
 
-The production deployment for `server-random-frame.amokrzycki.ovh` is Internet → Cloudflare → nginx HTTPS → `127.0.0.1:8787` → service → SQLite. Copy the built release binary and `deploy/` files to the VPS with `scp`, then install the binary at `/opt/random-frame-sync/random-frame-sync-server`; create a dedicated system user and private directories:
-
-```sh
-sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rf-sync
-sudo install -d -m 0755 -o root -g root /opt/random-frame-sync
-sudo install -m 0755 -o root -g root /tmp/random-frame-sync-server /opt/random-frame-sync/random-frame-sync-server
-sudo install -d -m 0700 -o rf-sync -g rf-sync /var/lib/random-frame-sync
-sudo install -d -m 0750 -o root -g rf-sync /etc/random-frame-sync
-sudo install -m 0640 -o root -g rf-sync /tmp/server.env.example /etc/random-frame-sync/server.env
-sudo install -m 0644 /tmp/random-frame-sync.service /etc/systemd/system/random-frame-sync.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now random-frame-sync.service
-```
-
-Install `deploy/random-frame-sync-limit.conf` under `/etc/nginx/conf.d/` and `deploy/server-random-frame.nginx` as a separate enabled site. Validate with `nginx -t`, then reload. The site file is the HTTP bootstrap; run Certbot for exactly `server-random-frame.amokrzycki.ovh` after DNS and port checks. Certbot adds HTTPS and the HTTP redirect to the live site. The site uses a `17m` nginx body cap, 30 requests/minute per client IP with burst 10, and disables access logs because URLs contain `sync_id`. Cloudflare client IPs are trusted only from published Cloudflare ranges; review those ranges periodically. Set Cloudflare SSL/TLS mode to Full (strict). The application enforces its own stricter byte limit and auth even without nginx.
+The production path is Cloudflare → nginx HTTPS → `127.0.0.1:8787` → systemd service → SQLite. See [deploy/README.md](deploy/README.md) for the initial VPS bootstrap, normal CD workflow, and rollback. The nginx config in this repo is an HTTP bootstrap example; the live Certbot-modified config is managed separately from application releases.
 
 Back up live SQLite via its backup API, not a raw copy of `sync.db` while WAL is active. The deployed `deploy/backup.py` runs daily through `random-frame-sync-backup.timer`, verifies `PRAGMA integrity_check`, and keeps 14 days of private local backups in `/var/backups/random-frame-sync`. For a one-off backup:
 
