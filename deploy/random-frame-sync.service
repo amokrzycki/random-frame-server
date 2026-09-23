@@ -1,0 +1,22 @@
+[Unit]
+Description=Random Frame Sync
+After=network.target
+
+[Service]
+Type=simple
+User=rf-sync
+Group=rf-sync
+EnvironmentFile=/etc/random-frame-sync/server.env
+WorkingDirectory=/var/lib/random-frame-sync
+ExecStart=/usr/local/bin/random-frame-sync-server
+Restart=on-failure
+RestartSec=5
+StateDirectory=random-frame-sync
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/random-frame-sync
+
+[Install]
+WantedBy=multi-user.target
