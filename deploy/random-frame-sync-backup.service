@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Random Frame Sync SQLite database
+
+[Service]
+Type=oneshot
+ExecStart=/opt/random-frame-sync/backup.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/random-frame-sync
