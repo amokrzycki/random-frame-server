@@ -1,0 +1,101 @@
+name: Deploy sync server
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'sync-server-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: random-frame-sync-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      DEPLOY_HOST: ${{ vars.SYNC_DEPLOY_HOST }}
+      DEPLOY_USER: ${{ vars.SYNC_DEPLOY_USER }}
+      PUBLIC_BASE_URL: ${{ vars.SYNC_PUBLIC_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Validate release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          [[ $sha =~ ^[0-9a-f]{40}$ ]]
+          echo "RF_SYNC_GIT_SHA=$sha" >> "$GITHUB_ENV"
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]; then
+            [[ $GITHUB_REF == "refs/heads/$DEFAULT_BRANCH" ]]
+          else
+            [[ $GITHUB_REF_NAME =~ ^sync-server-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+            [[ $GITHUB_REF_NAME == "sync-server-v$version" ]]
+          fi
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Quality gates
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked
+      - name: Build release
+        run: |
+          cargo build --release --locked
+          test -f target/release/random-frame-sync-server
+          test -x target/release/random-frame-sync-server
+      - name: Upload, deploy, and verify
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.SYNC_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SYNC_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n $DEPLOY_HOST && -n $DEPLOY_USER && $PUBLIC_BASE_URL == https://* ]]
+          umask 077
+          key=$RUNNER_TEMP/sync-deploy-key
+          hosts=$RUNNER_TEMP/sync-known-hosts
+          printf '%s\n' "$SSH_KEY" > "$key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$hosts"
+          chmod 600 "$key" "$hosts"
+          ssh_opts=(-i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$hosts")
+          remote="${DEPLOY_USER}@${DEPLOY_HOST}"
+          command=/usr/local/sbin/random-frame-sync-deploy
+          deployed=0
+          cleanup() {
+            if [[ $deployed == 1 ]]; then
+              echo 'deploy: public verification failed; requesting rollback' >&2
+              ssh "${ssh_opts[@]}" "$remote" "sudo -n $command rollback $RF_SYNC_GIT_SHA $previous" || echo 'deploy: remote rollback failed; manual intervention required' >&2
+            fi
+            rm -f "$key" "$hosts"
+          }
+          trap cleanup EXIT
+          previous=$(ssh "${ssh_opts[@]}" "$remote" "sudo -n $command current")
+          [[ $previous == legacy || $previous =~ ^[0-9a-f]{40}$ ]]
+          scp "${ssh_opts[@]}" target/release/random-frame-sync-server "$remote:/opt/random-frame-sync/staging/$RF_SYNC_GIT_SHA"
+          ssh "${ssh_opts[@]}" "$remote" "sudo -n $command deploy $RF_SYNC_GIT_SHA $previous"
+          if [[ $previous != "$RF_SYNC_GIT_SHA" ]]; then deployed=1; fi
+          base=${PUBLIC_BASE_URL%/}
+          for attempt in {1..20}; do
+            if curl --fail --silent --max-time 5 -H 'Cache-Control: no-cache' "$base/health?release=$RF_SYNC_GIT_SHA" |
+              python3 -c 'import json,sys; h=json.load(sys.stdin); sys.exit(0 if h.get("status") == "ok" and h.get("git_sha") == sys.argv[1] else 1)' "$RF_SYNC_GIT_SHA" 2>/dev/null; then
+              deployed=0
+              echo "deploy: public health reports $RF_SYNC_GIT_SHA"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'deploy: public health did not report expected SHA' >&2
+          exit 1
