@@ -34,28 +34,30 @@ Operational logs contain method, route template, status, latency, and internal D
 
 ## VPS example
 
-The files in `deploy/` are examples, not an active deployment. The intended path is Internet → nginx HTTPS → `127.0.0.1:8787` → service → SQLite. Install the binary at `/usr/local/bin/random-frame-sync-server`; create a dedicated system user and private directories:
+The production deployment for `server-random-frame.amokrzycki.ovh` is Internet → Cloudflare → nginx HTTPS → `127.0.0.1:8787` → service → SQLite. Copy the built release binary and `deploy/` files to the VPS with `scp`, then install the binary at `/opt/random-frame-sync/random-frame-sync-server`; create a dedicated system user and private directories:
 
 ```sh
-sudo useradd --system --home /var/lib/random-frame-sync --shell /usr/sbin/nologin rf-sync
+sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rf-sync
+sudo install -d -m 0755 -o root -g root /opt/random-frame-sync
+sudo install -m 0755 -o root -g root /tmp/random-frame-sync-server /opt/random-frame-sync/random-frame-sync-server
 sudo install -d -m 0700 -o rf-sync -g rf-sync /var/lib/random-frame-sync
 sudo install -d -m 0750 -o root -g rf-sync /etc/random-frame-sync
-sudo install -m 0640 -o root -g rf-sync deploy/server.env.example /etc/random-frame-sync/server.env
-sudo install -m 0644 deploy/random-frame-sync.service /etc/systemd/system/random-frame-sync.service
+sudo install -m 0640 -o root -g rf-sync /tmp/server.env.example /etc/random-frame-sync/server.env
+sudo install -m 0644 /tmp/random-frame-sync.service /etc/systemd/system/random-frame-sync.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now random-frame-sync.service
 ```
 
-Adapt `deploy/nginx.conf.example` with the actual hostname and certificate paths, place its `limit_req_zone` in nginx `http {}`, and its `server {}` there too. Validate with `nginx -t` before reload. The example listens only on HTTPS, uses a `17m` nginx body cap, 30 requests/minute per IP with burst 10, and disables access logs because URLs contain `sync_id`. The application enforces its own stricter byte limit and auth even without nginx. Clients must use HTTPS; the application has no TLS listener.
+Install `deploy/random-frame-sync-limit.conf` under `/etc/nginx/conf.d/` and `deploy/server-random-frame.nginx` as a separate enabled site. Validate with `nginx -t`, then reload. The site file is the HTTP bootstrap; run Certbot for exactly `server-random-frame.amokrzycki.ovh` after DNS and port checks. Certbot adds HTTPS and the HTTP redirect to the live site. The site uses a `17m` nginx body cap, 30 requests/minute per client IP with burst 10, and disables access logs because URLs contain `sync_id`. Cloudflare client IPs are trusted only from published Cloudflare ranges; review those ranges periodically. Set Cloudflare SSL/TLS mode to Full (strict). The application enforces its own stricter byte limit and auth even without nginx.
 
-Back up live SQLite via its backup API, not a raw copy of `sync.db` while WAL is active. For example, with a private backup destination:
+Back up live SQLite via its backup API, not a raw copy of `sync.db` while WAL is active. The deployed `deploy/backup.py` runs daily through `random-frame-sync-backup.timer`, verifies `PRAGMA integrity_check`, and keeps 14 days of private local backups in `/var/backups/random-frame-sync`. For a one-off backup:
 
 ```sh
-sudo -u rf-sync sqlite3 /var/lib/random-frame-sync/sync.db ".backup '/var/lib/random-frame-sync/sync-backup.db'"
+sudo /opt/random-frame-sync/backup.py
 ```
 
-Move the completed backup to protected off-host storage. Local device `SeenStore` data also survives a server failure, but the remote chain should still be backed up.
+Move a completed backup to protected off-host storage if VPS-loss recovery is required. Local device `SeenStore` data also survives a server failure.
 
-## Client contract (`reqwest` next stage)
+## Client contract
 
 Use an HTTPS base URL. Send the 64-character lowercase `sync_id` as a path segment and the independent 64-character lowercase auth token as `Authorization: Bearer <token>`. Send exact `EncryptedEnvelopeV1` bytes as `application/octet-stream`; never send plaintext or a recovery key. On first upload, `PUT /sync/{sync_id}` with `If-None-Match: *`, expect `201` and `ETag: "1"`. To download, `GET /sync/{sync_id}`, expect exact response bytes and a strong quoted decimal ETag; `404` means unavailable or unauthorized. To update, `PUT` new envelope bytes with the last observed `If-Match: "<revision>"`; `204` returns the next ETag. On `412`, fetch, decrypt and merge locally, then retry CAS. On `400`, fix the request; on `413`, shrink the envelope; on `429` or `5xx`, retry with backoff. Never assume the server validated crypto or merged snapshots.
