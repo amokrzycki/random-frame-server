@@ -23,6 +23,7 @@ jobs:
       DEPLOY_HOST: ${{ vars.SYNC_DEPLOY_HOST }}
       DEPLOY_USER: ${{ vars.SYNC_DEPLOY_USER }}
       PUBLIC_BASE_URL: ${{ vars.SYNC_PUBLIC_BASE_URL }}
+      ORIGIN_IP: ${{ vars.SYNC_DEPLOY_ORIGIN_IP }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -63,7 +64,7 @@ jobs:
           KNOWN_HOSTS: ${{ secrets.SYNC_DEPLOY_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          [[ -n $DEPLOY_HOST && -n $DEPLOY_USER && $PUBLIC_BASE_URL == https://* ]]
+          [[ -n $DEPLOY_HOST && -n $DEPLOY_USER && -n $ORIGIN_IP && $PUBLIC_BASE_URL == https://* ]]
           umask 077
           key=$RUNNER_TEMP/sync-deploy-key
           hosts=$RUNNER_TEMP/sync-known-hosts
@@ -90,8 +91,10 @@ jobs:
           ssh "${ssh_opts[@]}" "$remote" "sudo -n $command deploy $RF_SYNC_GIT_SHA $previous"
           if [[ $previous != "$RF_SYNC_GIT_SHA" ]]; then deployed=1; fi
           base=${PUBLIC_BASE_URL%/}
+          origin_host=${base#https://}
+          origin_host=${origin_host%%/*}
           for attempt in {1..20}; do
-            if http_status=$(curl --fail-with-body --silent --show-error --max-time 5 -o "$response" -w '%{http_code}' -H 'Cache-Control: no-cache' "$base/health?release=$RF_SYNC_GIT_SHA" 2>"$curl_error"); then
+            if http_status=$(curl --fail-with-body --silent --show-error --max-time 5 --noproxy '*' --resolve "$origin_host:443:$ORIGIN_IP" -o "$response" -w '%{http_code}' -H 'Cache-Control: no-cache' "$base/health?release=$RF_SYNC_GIT_SHA" 2>"$curl_error"); then
               curl_exit=0
             else
               curl_exit=$?
