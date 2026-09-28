@@ -4,7 +4,7 @@ server {
     listen [::]:80;
     server_name server-random-frame.amokrzycki.ovh;
 
-    client_max_body_size 17m;
+    client_max_body_size 65m;
     limit_req zone=rf_sync burst=10 nodelay;
     limit_req_status 429;
     access_log off;

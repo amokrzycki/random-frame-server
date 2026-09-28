@@ -1,22 +1,26 @@
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
+use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 
-const DEFAULT_MAX_PAYLOAD: usize = 16_000_068;
+const MAX_SYNC_PAYLOAD: usize = 67_108_864;
+const MAX_CONCURRENT_SYNC: usize = 4;
 const GIT_SHA: &str = match option_env!("RF_SYNC_GIT_SHA") {
     Some(sha) => sha,
     None => "unknown",
@@ -26,6 +30,7 @@ type ApiResult = Result<Response, StatusCode>;
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
+    sync_slots: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -39,20 +44,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8787".into())
         .parse()?;
     let db_path = PathBuf::from(env::var("RF_SYNC_DB").unwrap_or_else(|_| "sync.db".into()));
-    let max_payload: usize = env::var("RF_SYNC_MAX_PAYLOAD")
-        .unwrap_or_else(|_| DEFAULT_MAX_PAYLOAD.to_string())
-        .parse()?;
-    if !(1..=DEFAULT_MAX_PAYLOAD).contains(&max_payload) {
-        return Err("RF_SYNC_MAX_PAYLOAD must be 1..=16000068".into());
-    }
+    let max_payload = parse_max_payload(env::var("RF_SYNC_MAX_PAYLOAD").ok().as_deref())?;
     let db = open_db(&db_path).await?;
-    let app = app(AppState { db }, max_payload);
+    let app = app(
+        AppState {
+            db,
+            sync_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SYNC)),
+        },
+        max_payload,
+    );
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
     Ok(())
+}
+
+fn parse_max_payload(value: Option<&str>) -> Result<usize, Box<dyn std::error::Error>> {
+    let max = value.map_or(Ok(MAX_SYNC_PAYLOAD), str::parse::<usize>)?;
+    if !(1..=MAX_SYNC_PAYLOAD).contains(&max) {
+        return Err("RF_SYNC_MAX_PAYLOAD must be 1..=67108864".into());
+    }
+    Ok(max)
 }
 
 #[expect(
@@ -90,7 +104,7 @@ async fn open_db(path: &std::path::Path) -> Result<SqlitePool, sqlx::Error> {
 fn app(state: AppState, max_payload: usize) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/sync/{sync_id}", get(read).put(write))
+        .route("/sync/{sync_id}", get(read).put(write).layer(middleware::from_fn_with_state(state.clone(), limit_sync)))
         .layer(DefaultBodyLimit::max(max_payload))
         .layer(TraceLayer::new_for_http()
             .make_span_with(|request: &axum::http::Request<_>| {
@@ -102,6 +116,30 @@ fn app(state: AppState, max_payload: usize) -> Router {
                 tracing::info!(status = %response.status(), latency_ms = latency.as_millis(), "response");
             }))
         .with_state(state)
+}
+
+async fn limit_sync(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let permit = state
+        .sync_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let is_get = request.method() == Method::GET;
+    let response = next.run(request).await;
+    if is_get {
+        Ok(response.map(|body| {
+            Body::new(body.map_frame(move |frame| {
+                let _keep_permit = &permit;
+                frame
+            }))
+        }))
+    } else {
+        Ok(response)
+    }
 }
 
 fn valid_hex64(value: &str) -> bool {
@@ -216,7 +254,8 @@ async fn read(
     validate_id(&sync_id)?;
     let verifier = bearer(&headers)?;
     let row =
-        sqlx::query("SELECT auth_verifier, revision, payload FROM sync_chains WHERE sync_id = ?")
+        sqlx::query("SELECT auth_verifier, revision, CASE WHEN length(payload) <= ? THEN payload ELSE NULL END AS payload FROM sync_chains WHERE sync_id = ?")
+            .bind(i64::try_from(MAX_SYNC_PAYLOAD).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
             .bind(sync_id)
             .fetch_optional(&state.db)
             .await
@@ -229,7 +268,11 @@ async fn read(
         return Err(StatusCode::NOT_FOUND);
     }
     let revision: i64 = row.try_get("revision").map_err(db_error)?;
-    let payload: Vec<u8> = row.try_get("payload").map_err(db_error)?;
+    let payload: Option<Vec<u8>> = row.try_get("payload").map_err(db_error)?;
+    let Some(payload) = payload else {
+        tracing::error!(kind = "payload_oversized", "storage failure");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
     Ok((
         [
             (
@@ -345,6 +388,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState {
             db: open_db(&dir.path().join("sync.db")).await.unwrap(),
+            sync_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SYNC)),
         };
         let router = app(state.clone(), max);
         (dir, state, router)
@@ -404,6 +448,18 @@ mod tests {
             format!("{:x}", Sha256::digest(TOKEN.as_bytes())),
             "b4029f45e1ecb8ff49a25ab1f5ab5527620de4beda89d948c9b939d19c02804c"
         );
+    }
+
+    #[test]
+    fn payload_configuration() {
+        assert_eq!(parse_max_payload(None).unwrap(), MAX_SYNC_PAYLOAD);
+        assert_eq!(
+            parse_max_payload(Some("67108864")).unwrap(),
+            MAX_SYNC_PAYLOAD
+        );
+        assert_eq!(parse_max_payload(Some("1024")).unwrap(), 1024);
+        assert!(parse_max_payload(Some("67108865")).is_err());
+        assert!(parse_max_payload(Some("0")).is_err());
     }
 
     #[tokio::test]
@@ -588,7 +644,13 @@ mod tests {
         drop(router);
         state.db.close().await;
         let reopened = open_db(&dir.path().join("sync.db")).await.unwrap();
-        let router = app(AppState { db: reopened }, 100);
+        let router = app(
+            AppState {
+                db: reopened,
+                sync_slots: state.sync_slots,
+            },
+            100,
+        );
         let got = request(&router, Method::GET, ID, Some(TOKEN), None, None, vec![]).await;
         assert_eq!(tag(&got), "\"11\"");
         assert!(matches!(
@@ -613,6 +675,66 @@ mod tests {
         let statuses = [a.status(), b.status()];
         assert!(statuses.contains(&StatusCode::CREATED));
         assert!(statuses.contains(&StatusCode::PRECONDITION_FAILED));
+    }
+
+    #[tokio::test]
+    async fn sync_concurrency_rejects_and_keeps_health_available() {
+        let (_dir, state, router) = setup(100).await;
+        let slots = (0..MAX_CONCURRENT_SYNC)
+            .map(|_| state.sync_slots.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(state.sync_slots.available_permits(), 0);
+        assert_eq!(
+            put(&router, TOKEN, ("if-none-match", "*"), vec![1])
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            request(&router, Method::GET, ID, Some(TOKEN), None, None, vec![])
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        drop(slots);
+        assert_eq!(
+            put(&router, TOKEN, ("if-none-match", "*"), vec![1])
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        let got = request(&router, Method::GET, ID, Some(TOKEN), None, None, vec![]).await;
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(
+            state.sync_slots.available_permits(),
+            MAX_CONCURRENT_SYNC - 1
+        );
+        let slots = (0..MAX_CONCURRENT_SYNC - 1)
+            .map(|_| state.sync_slots.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            put(&router, TOKEN, ("if-match", "\"1\""), vec![2])
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(got);
+        assert_eq!(state.sync_slots.available_permits(), 1);
+        drop(slots);
     }
 
     #[tokio::test]
@@ -643,28 +765,60 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_maximum() {
-        let (_dir, _state, router) = setup(DEFAULT_MAX_PAYLOAD).await;
+        let (_dir, state, router) = setup(MAX_SYNC_PAYLOAD).await;
         assert_eq!(
             put(
                 &router,
                 TOKEN,
                 ("if-none-match", "*"),
-                vec![0; DEFAULT_MAX_PAYLOAD]
+                vec![0; MAX_SYNC_PAYLOAD]
             )
             .await
             .status(),
             StatusCode::CREATED
         );
+        let got = request(&router, Method::GET, ID, Some(TOKEN), None, None, vec![]).await;
+        assert_eq!(tag(&got), "\"1\"");
+        let payload = to_bytes(got.into_body(), MAX_SYNC_PAYLOAD).await.unwrap();
+        assert_eq!(payload.len(), MAX_SYNC_PAYLOAD);
+        assert!(payload.iter().all(|byte| *byte == 0));
         assert_eq!(
             put(
                 &router,
                 TOKEN,
                 ("if-match", "\"1\""),
-                vec![0; DEFAULT_MAX_PAYLOAD + 1]
+                vec![0; MAX_SYNC_PAYLOAD + 1]
             )
             .await
             .status(),
             StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let updated = put(&router, TOKEN, ("if-match", "\"1\""), vec![1]).await;
+        assert_eq!(updated.status(), StatusCode::NO_CONTENT);
+        assert_eq!(tag(&updated), "\"2\"");
+        assert_eq!(
+            put(&router, TOKEN, ("if-match", "\"1\""), vec![2])
+                .await
+                .status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        sqlx::query("UPDATE sync_chains SET payload = zeroblob(?) WHERE sync_id = ?")
+            .bind(i64::try_from(MAX_SYNC_PAYLOAD + 1).unwrap())
+            .bind(ID)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&router, Method::GET, ID, Some(TOKEN), None, None, vec![])
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            request(&router, Method::GET, ID, Some(WRONG), None, None, vec![])
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
         );
     }
 }
