@@ -38,17 +38,17 @@ The script is root-owned and validates its subcommands and full 40-character low
 
 Create GitHub Environment `production`. Configure its protection rules and protect `sync-server-v*` tag creation according to who may deploy. The workflow reads these environment values:
 
-| Kind | Name | Format |
-| --- | --- | --- |
-| Variable | `SYNC_DEPLOY_HOST` | VPS SSH IP or DNS name, no scheme, e.g. `203.0.113.10` |
-| Variable | `SYNC_DEPLOY_USER` | `rf-deploy` |
-| Variable | `SYNC_PUBLIC_BASE_URL` | `https://server-random-frame.amokrzycki.ovh` |
-| Secret | `SYNC_DEPLOY_SSH_KEY` | Complete OpenSSH private key, including BEGIN/END lines; no example key committed |
-| Secret | `SYNC_DEPLOY_KNOWN_HOSTS` | Verified OpenSSH known_hosts line for the exact SSH host, e.g. `203.0.113.10 ssh-ed25519 AAAA...` |
+| Kind     | Name                      | Format                                                                                            |
+| -------- | ------------------------- | ------------------------------------------------------------------------------------------------- |
+| Variable | `SYNC_DEPLOY_HOST`        | VPS SSH IP or DNS name, no scheme, e.g. `203.0.113.10`                                            |
+| Variable | `SYNC_DEPLOY_USER`        | `rf-deploy`                                                                                       |
+| Variable | `SYNC_PUBLIC_BASE_URL`    | `https://server-random-frame.amokrzycki.ovh`                                                      |
+| Secret   | `SYNC_DEPLOY_SSH_KEY`     | Complete OpenSSH private key, including BEGIN/END lines; no example key committed                 |
+| Secret   | `SYNC_DEPLOY_KNOWN_HOSTS` | Verified OpenSSH known_hosts line for the exact SSH host, e.g. `203.0.113.10 ssh-ed25519 AAAA...` |
 
 ## Normal deployment
 
-The workflow runs on a pushed tag matching `sync-server-v*` (and requires a `sync-server-vMAJOR.MINOR.PATCH` name equal to `Cargo.toml`'s package version), or through `workflow_dispatch` on the repository default branch. `Cargo.toml` is currently `0.1.0`, so the first version tag would be `sync-server-v0.1.0`. Use a new tag for each release. The production Environment can require approval. Workflow concurrency allows only one production run at a time; the VPS script also takes a nonblocking `flock`. A newer queued workflow may supersede an older queued workflow, while a running workflow is never canceled automatically.
+The workflow runs on a pushed tag matching `sync-server-v*` (and requires a `sync-server-vMAJOR.MINOR.PATCH` name equal to `Cargo.toml`'s package version), or through `workflow_dispatch` on the repository default branch. `Cargo.toml` is currently `0.2.0`, so the first version tag would be `sync-server-v0.1.0`. Use a new tag for each release. The production Environment can require approval. Workflow concurrency allows only one production run at a time; the VPS script also takes a nonblocking `flock`. A newer queued workflow may supersede an older queued workflow, while a running workflow is never canceled automatically.
 
 The GitHub runner installs Rust 1.98.1, checks formatting, Clippy, and tests, builds `cargo build --release --locked`, and embeds the checkout's full git SHA in the binary. It uploads only that binary over host-key-verified SSH to `/opt/random-frame-sync/staging/<sha>`; it never copies the repo, DB, or configuration. The root script contract is:
 

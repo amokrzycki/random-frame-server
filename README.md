@@ -11,7 +11,7 @@ cargo build --release --locked
 RF_SYNC_DB=./sync.db ./target/release/random-frame-sync-server
 ```
 
-Configuration: `RF_SYNC_BIND` defaults to `127.0.0.1:8787`; `RF_SYNC_DB` defaults to `sync.db`; `RF_SYNC_MAX_PAYLOAD` defaults to `16000068` and accepts `1..=16000068`; `RUST_LOG` defaults to `info`. The service creates the DB file, but its parent directory must exist. Keep the DB directory private: the database and WAL hold the opaque payloads and auth verifiers. The bind is deliberately loopback-only by default.
+Configuration: `RF_SYNC_BIND` defaults to `127.0.0.1:8787`; `RF_SYNC_DB` defaults to `sync.db`; `RF_SYNC_MAX_PAYLOAD` defaults to `67108864` and accepts `1..=67108864`; `RUST_LOG` defaults to `info`. The service creates the DB file, but its parent directory must exist. Keep the DB directory private: the database and WAL hold the opaque payloads and auth verifiers. The bind is deliberately loopback-only by default. At most four `/sync/{sync_id}` requests run at once; excess requests receive `503`.
 
 ## API
 
