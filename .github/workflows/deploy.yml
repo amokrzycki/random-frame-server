@@ -67,6 +67,8 @@ jobs:
           umask 077
           key=$RUNNER_TEMP/sync-deploy-key
           hosts=$RUNNER_TEMP/sync-known-hosts
+          response=$RUNNER_TEMP/sync-public-health-response
+          curl_error=$RUNNER_TEMP/sync-public-health-curl-error
           printf '%s\n' "$SSH_KEY" > "$key"
           printf '%s\n' "$KNOWN_HOSTS" > "$hosts"
           chmod 600 "$key" "$hosts"
@@ -79,7 +81,7 @@ jobs:
               echo 'deploy: public verification failed; requesting rollback' >&2
               ssh "${ssh_opts[@]}" "$remote" "sudo -n $command rollback $RF_SYNC_GIT_SHA $previous" || echo 'deploy: remote rollback failed; manual intervention required' >&2
             fi
-            rm -f "$key" "$hosts"
+            rm -f "$key" "$hosts" "$response" "$curl_error"
           }
           trap cleanup EXIT
           previous=$(ssh "${ssh_opts[@]}" "$remote" "sudo -n $command current")
@@ -89,11 +91,27 @@ jobs:
           if [[ $previous != "$RF_SYNC_GIT_SHA" ]]; then deployed=1; fi
           base=${PUBLIC_BASE_URL%/}
           for attempt in {1..20}; do
-            if curl --fail --silent --max-time 5 -H 'Cache-Control: no-cache' "$base/health?release=$RF_SYNC_GIT_SHA" |
-              python3 -c 'import json,sys; h=json.load(sys.stdin); sys.exit(0 if h.get("status") == "ok" and h.get("git_sha") == sys.argv[1] else 1)' "$RF_SYNC_GIT_SHA" 2>/dev/null; then
+            if http_status=$(curl --fail-with-body --silent --show-error --max-time 5 -o "$response" -w '%{http_code}' -H 'Cache-Control: no-cache' "$base/health?release=$RF_SYNC_GIT_SHA" 2>"$curl_error"); then
+              curl_exit=0
+            else
+              curl_exit=$?
+            fi
+            if [[ $curl_exit == 0 && $http_status == 2?? ]] &&
+              python3 -c 'import json,sys; h=json.load(sys.stdin); sys.exit(0 if h.get("status") == "ok" and h.get("git_sha") == sys.argv[1] else 1)' "$RF_SYNC_GIT_SHA" < "$response" 2>/dev/null; then
               deployed=0
               echo "deploy: public health reports $RF_SYNC_GIT_SHA"
               exit 0
+            fi
+            if [[ $attempt == 20 ]]; then
+              if [[ $http_status =~ ^[0-9]{3}$ && $http_status != 000 ]]; then
+                echo "deploy: public health returned HTTP $http_status" >&2
+                echo 'deploy: response body:' >&2
+                cat "$response" >&2
+                if [[ $curl_exit != 0 ]]; then cat "$curl_error" >&2; fi
+              else
+                echo "deploy: public health curl/network error (exit $curl_exit):" >&2
+                cat "$curl_error" >&2
+              fi
             fi
             sleep 2
           done
